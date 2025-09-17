@@ -9,11 +9,13 @@ from airflow.providers.http.operators.http import HttpOperator
 from datetime import timedelta, datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+TMDB_URL_BASE="https://api.themoviedb.org/3"
 TOKEN_TMDB = "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJkYWRjYTk2NjIyYTdmZTk5MjUxNGM0NWQxYzBiMjYxYSIsIm5iZiI6MTc1NjMyODA1OC43MjUsInN1YiI6IjY4YWY3MDdhOWE3OTRlNzI4YjM5MDkwNyIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.Q8upWLzXDwM5HVyMCg1lf7iAHPhDdZqhg0jRXZfpIB4"
-TMDB_PAGINAS_TOTALES = 100
+TMDB_PAGINAS_TOTALES = 500 # 577667 paginas en total creo
 FIELDNAMES_PELICULAS=[
                     "id", "title", "adult", "budget", "original_language", "popularity",
                     "release_date", "revenue", "runtime", "status", "vote_average", "vote_count"]
+LIMITE_PAGINAS=500 # la api no permite hacer una request para paginas mayores a la 500, pesimo
 
 default_args = {
     "owner": "airflow",
@@ -23,27 +25,78 @@ default_args = {
 
 task_logger = logging.getLogger("airflow.task")
 
-# Trae los resultados de todos los HttpOperator 
-# y guarda lo relevante de cada pelicula en un csv
-def guardar_peliculas_en_csv(**kwargs):
-    ti = kwargs["ti"]
-    task_logger.info("Peliculas descargadas. Guardando en csv...")
-    results = []
-    for i in range(1, TMDB_PAGINAS_TOTALES):
-        task_logger.info(f"Guardando peliculas de la pagina {i}")
-        response = ti.xcom_pull(task_ids=f"buscar_peliculas_pagina_{i}")
-        data = json.loads(response)
-        for movie in data.get("results", []):
-            results.append([movie["id"]])
-    task_logger.info(f"Total de peliculas: {len(results)}")
+def obtener_rangos_fechas(desde="2000-01-01", hasta=datetime.now().strftime("%Y-%m-%d")):
+    """Genera rangos de fechas año por año desde 'desde' hasta 'hasta'."""
+    rangos = []
+    inicio = datetime.strptime(desde, "%Y-%m-%d")
+    fin = datetime.strptime(hasta, "%Y-%m-%d")
+
+    while inicio.year <= fin.year:
+        comienzo = inicio.replace(month=1, day=1)
+        fin_anio = inicio.replace(month=12, day=31)
+        if fin_anio > fin:
+            fin_anio = fin
+        rangos.append((comienzo.strftime("%Y-%m-%d"), fin_anio.strftime("%Y-%m-%d")))
+        inicio = inicio.replace(year=inicio.year + 1)
+
+    return rangos
+
+def obtener_ids_peliculas():
+    def buscar_pagina_peliculas(page, fecha_inicio, fecha_fin):
+        url = (
+            f"{TMDB_URL_BASE}/discover/movie?"
+            f"page={page}&sort_by=popularity.desc&include_adult=true&language=en-US"
+            f"&primary_release_date.gte={fecha_inicio}&primary_release_date.lte={fecha_fin}"
+        )
+        headers = {
+            "accept": "application/json",
+            "Authorization": f"Bearer {TOKEN_TMDB}"
+        }
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            return response.json()["results"]
+        except Exception as e:
+            task_logger.error(f"Error al descargar pagina {page} ({fecha_inicio} a {fecha_fin}): {e}")
+            return None
+
     with open("/opt/airflow/data/peliculas.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["id"])
-        writer.writerows(results)
+
+        rangos_fechas = obtener_rangos_fechas(desde="2010-01-01")  # <-- ajustá el año inicial si querés
+        for fecha_inicio, fecha_fin in rangos_fechas:
+            # Primero pedimos página 1 para ver cuántas páginas tiene este rango
+            url_primera = (
+                f"{TMDB_URL_BASE}/discover/movie?page=1&sort_by=popularity.desc&include_adult=true&language=en-US"
+                f"&primary_release_date.gte={fecha_inicio}&primary_release_date.lte={fecha_fin}"
+            )
+            headers = {"accept": "application/json", "Authorization": f"Bearer {TOKEN_TMDB}"}
+            resp = requests.get(url_primera, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                task_logger.error(f"No se pudo obtener página 1 para rango {fecha_inicio} - {fecha_fin}")
+                continue
+
+            data = resp.json()
+            total_pages = min(data.get("total_pages", 1), LIMITE_PAGINAS)  # respetamos el límite de TMDB
+            task_logger.info(f"Procesando {total_pages} páginas para rango {fecha_inicio} - {fecha_fin}")
+
+            with ThreadPoolExecutor(max_workers=40) as executor:
+                futuros = {
+                    executor.submit(buscar_pagina_peliculas, page, fecha_inicio, fecha_fin): page
+                    for page in range(1, total_pages + 1)
+                }
+
+                for futuro in as_completed(futuros):
+                    result = futuro.result()
+                    if result:
+                        ids = [[pelicula["id"]] for pelicula in result if "id" in pelicula]
+                        writer.writerows(ids)
+
 
 # Helper para poder paralelizar la busqueda de detalles (si no se demoraba una banda buscar todo 1 por 1)
 def buscar_detalles_pelicula(pelicula_id):
-    url = f"https://api.themoviedb.org/3/movie/{pelicula_id}?language=en-US"
+    url = f"{TMDB_URL_BASE}/movie/{pelicula_id}?language=en-US"
     headers = {
         "accept": "application/json",
         "Authorization": f"Bearer {TOKEN_TMDB}"
@@ -96,32 +149,14 @@ with DAG(
     catchup=False,
 ) as dag:
 
-    # Todas van a correr en paralelo
-    tasks = []
-    for page in range(1, TMDB_PAGINAS_TOTALES):
-        task = HttpOperator(
-            task_id=f"buscar_peliculas_pagina_{page}",
-            # un embole, pero hay que definir esta conn_id en la interfaz de airflow
-            # Config -> Connections -> Add Connection -> y poner los datos de TMDB 
-            # (solo la base URL en realidad)
-            http_conn_id="tmdb_api",
-            endpoint=f"/3/discover/movie?page={page}&sort_by=popularity.desc&include_adult=false&include_video=false&language=en-US",
-            method="GET",
-            headers={
-                "accept": "application/json",
-                "Authorization": f"Bearer {TOKEN_TMDB}"
-            },
-        )
-        tasks.append(task)
-
-    peliculas_csv = PythonOperator(
-        task_id="guardar_peliculas_en_csv",
-        python_callable=guardar_peliculas_en_csv,
+    obtener_ids_peliculas = PythonOperator(
+        task_id="obtener_ids_peliculas",
+        python_callable=obtener_ids_peliculas,
     )
 
-    detalles_csv = PythonOperator(
+    buscar_detalles_peliculas = PythonOperator(
         task_id="agregar_detalles_peliculas_a_csv",
         python_callable=agregar_detalles_peliculas_a_csv,
     )
 
-    tasks >> peliculas_csv >> detalles_csv
+    obtener_ids_peliculas >> buscar_detalles_peliculas
