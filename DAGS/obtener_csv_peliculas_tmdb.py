@@ -11,11 +11,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TMDB_URL_BASE="https://api.themoviedb.org/3"
 TOKEN_TMDB = "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJkYWRjYTk2NjIyYTdmZTk5MjUxNGM0NWQxYzBiMjYxYSIsIm5iZiI6MTc1NjMyODA1OC43MjUsInN1YiI6IjY4YWY3MDdhOWE3OTRlNzI4YjM5MDkwNyIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.Q8upWLzXDwM5HVyMCg1lf7iAHPhDdZqhg0jRXZfpIB4"
-TMDB_PAGINAS_TOTALES = 500 # 577667 paginas en total creo
 FIELDNAMES_PELICULAS=[
                     "id", "title", "adult", "budget", "original_language", "popularity",
-                    "release_date", "revenue", "runtime", "status", "vote_average", "vote_count"]
-LIMITE_PAGINAS=500 # la api no permite hacer una request para paginas mayores a la 500, pesimo
+                    "release_date", "revenue", "runtime", "status", "tagline", 
+                    "overview", "vote_average", "vote_count", "genres", "production_companies",
+                    "spoken_languages", "belongs_to_collection"]
+# Cada pagina trae 22 pelis aprox, por ende el calculo para saber el total de registros que traemos
+# va a ser 22 * años * paginas_por_año. Ahora son 150 paginas por año
+# desde el 1940, por lo que son unas 280.000 peliculas
+LIMITE_PAGINAS=150 # la api no permite hacer una request para paginas mayores a la 500
 
 default_args = {
     "owner": "airflow",
@@ -61,10 +65,10 @@ def obtener_ids_peliculas():
             return None
 
     with open("/opt/airflow/data/peliculas.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
+        writer = csv.writer(f, delimiter=";")
         writer.writerow(["id"])
 
-        rangos_fechas = obtener_rangos_fechas(desde="2010-01-01")  # <-- ajustá el año inicial si querés
+        rangos_fechas = obtener_rangos_fechas(desde="1940-01-01")  # Desde 1940 buscamos peliculas
         for fecha_inicio, fecha_fin in rangos_fechas:
             # Primero pedimos página 1 para ver cuántas páginas tiene este rango
             url_primera = (
@@ -105,7 +109,17 @@ def buscar_detalles_pelicula(pelicula_id):
         r = requests.get(url, headers=headers, timeout=10)
         r.raise_for_status() # Si largo error la peticion, esto larga error aca en el codigo
         data = r.json()
-        task_logger.info(f"Descargados detalles de la película {pelicula_id}, {data['title']}")
+        # Hay datos que vienen como arreglos u otras cosas, que debemos extraer a texto
+        data["genres"] = ", ".join([gen["name"] for gen in data["genres"]])
+        data["production_companies"] = ", ".join([comp["name"] for comp in data["production_companies"]])
+        data["spoken_languages"] = ", ".join([lang["english_name"] for lang in data["spoken_languages"]])
+        # Puede venir en null si no esta en ninguna coleccion
+        data["belongs_to_collection"] = (
+            data["belongs_to_collection"]["name"]
+            if isinstance(data.get("belongs_to_collection"), dict)
+            else None
+        )
+        task_logger.info(f"Descargados detalles de la película {data['id']}, {data['title']}")
         # Creamos un diccionario solo con los campos que nos interesan
         return {field: data.get(field) for field in FIELDNAMES_PELICULAS}
     except Exception as e:
@@ -137,7 +151,7 @@ def agregar_detalles_peliculas_a_csv():
         
     with open("/opt/airflow/data/peliculas.csv", "w", newline="", encoding="utf-8") as f:
         fieldnames = fieldnames = FIELDNAMES_PELICULAS
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter=";")
         writer.writeheader()
         writer.writerows(filas_actualizadas)
 
