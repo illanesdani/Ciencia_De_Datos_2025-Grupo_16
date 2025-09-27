@@ -19,7 +19,8 @@ FIELDNAMES_PELICULAS=[
 # Cada pagina trae 22 pelis aprox, por ende el calculo para saber el total de registros que traemos
 # va a ser 22 * años * paginas_por_año. Ahora son 150 paginas por año
 # desde el 1940, por lo que son unas 280.000 peliculas
-LIMITE_PAGINAS=2 # la api no permite hacer una request para paginas mayores a la 500
+LIMITE_PAGINAS=150 # la api no permite hacer una request para paginas mayores a la 500
+ANIO_DESDE=1940
 
 default_args = {
     "owner": "airflow",
@@ -68,7 +69,7 @@ def obtener_ids_peliculas():
         writer = csv.writer(f, delimiter=";")
         writer.writerow(["id"])
 
-        rangos_fechas = obtener_rangos_fechas(desde="1940-01-01")  # Desde 1940 buscamos peliculas
+        rangos_fechas = obtener_rangos_fechas(desde=f"{ANIO_DESDE}-01-01")  # Desde 1940 buscamos peliculas
         for fecha_inicio, fecha_fin in rangos_fechas:
             # Primero pedimos página 1 para ver cuántas páginas tiene este rango
             url_primera = (
@@ -100,25 +101,15 @@ def obtener_ids_peliculas():
 
 # Helper para poder paralelizar la busqueda de detalles (si no se demoraba una banda buscar todo 1 por 1)
 def buscar_detalles_pelicula(pelicula_id):
-    url_detalles = f"{TMDB_URL_BASE}/movie/{pelicula_id}?language=en-US"
-    url_creditos = f"{TMDB_URL_BASE}/movie/{pelicula_id}/credits?language=en-US"
-    url_keywords = f"{TMDB_URL_BASE}/movie/{pelicula_id}/keywords"
+    url = f"{TMDB_URL_BASE}/movie/{pelicula_id}?language=en-US&append_to_response=credits,keywords"
     headers = {
         "accept": "application/json",
         "Authorization": f"Bearer {TOKEN_TMDB}"
     }
     try:
-        r_detalles = requests.get(url_detalles, headers=headers, timeout=20)
-        r_detalles.raise_for_status() # Si largo error la peticion, esto larga error aca en el codigo
-        data = r_detalles.json()
-
-        r_creditos = requests.get(url_creditos, headers=headers, timeout=20)
-        r_creditos.raise_for_status()
-        data_creditos = r_creditos.json()
-        
-        r_keywords = requests.get(url_keywords, headers=headers, timeout=20)
-        r_keywords.raise_for_status()
-        data_keywords = r_keywords.json()
+        r = requests.get(url, headers=headers, timeout=20)
+        r.raise_for_status() # Si largo error la peticion, esto larga error aca en el codigo
+        data = r.json()
         # Hay datos que vienen como arreglos u otras cosas, que debemos extraer a texto
         data["genres"] = ", ".join([gen["name"] for gen in data["genres"]])
         data["production_companies"] = ", ".join([comp["name"] for comp in data["production_companies"]])
@@ -130,14 +121,14 @@ def buscar_detalles_pelicula(pelicula_id):
             else None
         )
         # Pueden ser una banda o ninguna, depende la fama de la peli
-        data["keywords"] = ", ".join([keyword["name"] for keyword in data_keywords["keywords"]])
+        data["keywords"] = ", ".join([keyword["name"] for keyword in data["keywords"]["keywords"]])
         # Unimos por si hay mas de 1 director, como en matrix
         # Viene el genero tamb. Asi que lo ponemos al lado del nombre del director y actor mas abajo, separados con
         # un | . En algunos es 0, 1, o 2, habra que ver que es que. Quiza 0 es no hay dato
-        data["directors"] = ", ".join([f"{person["name"]}|{person["gender"]}" for person in data_creditos["crew"] if person["job"] == "Director"])
+        data["directors"] = ", ".join([f"{person["name"]}|{person["gender"]}" for person in data["credits"]["crew"] if person["job"] == "Director"])
         # Los actores vienen todos todos y pueden ser muchos. Pero al menos vienen ordenados como aparecen en los creditos
         # que es mas o menos un orden de importancia. Asi que solo los primeros 10 tomamos.
-        data["main_actors"] = ", ".join([f"{person["name"]}|{person["gender"]}" for person in data_creditos["cast"][:10]])
+        data["main_actors"] = ", ".join([f"{person["name"]}|{person["gender"]}" for person in data["credits"]["cast"][:10]])
         task_logger.info(f"Descargados detalles de la película {data['id']}, {data['title']}")
         # Creamos un diccionario solo con los campos que nos interesan
         return {field: data.get(field) for field in FIELDNAMES_PELICULAS}
@@ -155,10 +146,8 @@ def agregar_detalles_peliculas_a_csv():
         movie_ids = [row["id"] for row in reader]
 
     filas_actualizadas = []
-    # Ejecutamos las requests concurrentes. Cada detalle tiene que hacer 3 peticiones..
-    # asi que ponemos 20 (nos pasamos por 10 mas o menos pero veremos si nos bloquea).
-    # Va a estar 3 años
-    with ThreadPoolExecutor(max_workers=30) as executor:
+    # Ejecutamos las requests concurrentes.
+    with ThreadPoolExecutor(max_workers=50) as executor:
         # Genera todas las requests a la vez para todas las peliculas, y se van ejecutando
         # en paralelo a medida que quedan disponibles los hilos del ThreadPool. copado
         futuros_resultados_detalles = {executor.submit(buscar_detalles_pelicula, pelicula_id): pelicula_id for pelicula_id in movie_ids}
